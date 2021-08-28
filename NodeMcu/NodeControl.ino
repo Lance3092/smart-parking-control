@@ -1,19 +1,73 @@
+#include <Arduino_JSON.h>
+
 #include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
+//#include <HTTPClient.h>
+#include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
 #include <ArduinoJson.h>
 #include <string>
 #include <bitset>
+//#include <Bridge.h>
+
+//Ultra Sonic Sensor Variabls 
+// defines pins numbers
+const int trigPin = 4;  
+const int echoPin = 5;  
+unsigned long previousMillis = 0;
+unsigned int checkInterval = 1000;
+int ultrasonicdistance = 0;
+bool currentState ;
+int carHeight = 40;
+bool previousOccupied = false;
+// defines variables
+long duration;
+int distance;
+
+const int pins[] = {14,12,13}; //pins D5,D6,D7 on Node MCU board;
+
 #define HTTP_REST_PORT 80
 #define WIFI_RETRY_DELAY 500
 //Network Variables 
 const char* ssid = "devpinetwork";
 const char* password = "raspberry";
-const char* boardHostName = "test01";
-
+const String bayID = "0001";
+const String boardHostName = "baycontroller" + bayID;
+const String hostController = "http://devpi.local:5000";
+WiFiClient wifiClient;
+bool isOccupied = false; 
+int ledColor = 0 ;
 ESP8266WebServer server(HTTP_REST_PORT);
 void getHelloWord() {
     server.send(200, "text/json", "{\"name\": \"Hello world\"}");
 }
+
+void setUpLEDStatus() {
+  HTTPClient http;
+  String serverName = hostController + "/setup/" + bayID ;
+  http.begin(wifiClient , serverName);
+  int httpResponseCode = http.GET();
+  String payload = "{}"; 
+  if (httpResponseCode>0) {
+    payload = http.getString();
+    Serial.println(payload);
+    DynamicJsonDocument doc(512);
+    DeserializationError error = deserializeJson(doc, payload);
+    if(error){
+      Serial.println("Error parsing JSON");
+    }
+    JsonObject jObj = doc.as<JsonObject>();
+    if(jObj.containsKey("bayStatus"))
+      {
+        int val = jObj["bayStatus"].as<int>();
+        writeToLED(val);
+      }
+  }
+  
+  http.end();
+
+ 
+}
+
 void postStatusLED(){
   String postBody = server.arg("plain");
   Serial.println(postBody);
@@ -34,9 +88,9 @@ void postStatusLED(){
     Serial.println(server.method());
     if(server.method() == HTTP_POST)
     {
-      if(postObj.containsKey("currentStatus"))
+      if(postObj.containsKey("bayStatus"))
       {
-        int val = postObj["currentStatus"].as<int>();
+        int val = postObj["bayStatus"].as<int>();
         writeToLED(val);
         server.send(200,F("text/html"),"LED Set");
       }
@@ -46,7 +100,7 @@ void postStatusLED(){
   }
   
 }
-const int pins[] = {14,12,13}; //pins D5,D6,D7 on Node MCU board;
+
 void setupServer() {
     server.on("/", HTTP_GET, []() {
         server.send(200, "text/html",
@@ -82,6 +136,11 @@ void setupPins()
   pinMode(pins[0],OUTPUT);
   pinMode(pins[1],OUTPUT);
   pinMode(pins[2],OUTPUT);
+
+  // Ultra Sonic 
+  pinMode(trigPin, OUTPUT); // Sets the trigPin as an Output
+  pinMode(echoPin, INPUT); // Sets the echoPin as an Input
+  
   //LEDS flash all colors to show intialisation 
   for(int i = 0;i <= 7;i++){
     writeToLED(i);
@@ -95,14 +154,77 @@ void setup() {
   setupWifi();
   setupServer();
   setupPins();
+  setUpLEDStatus() ;
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
-    server.handleClient();
+  server.handleClient();
+  unsigned long currentMillis = millis();
+  if(currentMillis - previousMillis >= checkInterval) 
+  {
+    previousMillis = currentMillis;
+    CheckValue();  
+  }
 
 }
+void updateParkingState(bool newState) {
+  HTTPClient http;
+  String serverName = hostController + "/updateParkingState/" + bayID ;
+  http.begin(wifiClient , serverName);
+  StaticJsonDocument<512> docSend;
+  JsonObject object = docSend.to<JsonObject>();
+  http.addHeader("Content-Type", "application/json");
+  object["bayState"] = newState;
+  String jsonObj;
+  serializeJson(docSend,jsonObj);
+  Serial.println("Sending Message : ");
+  Serial.println(jsonObj);
+  Serial.println("To : ");
+  Serial.println(serverName);
+  int httpResponseCode = http.POST(jsonObj);
+  String payload = "{}"; 
+  if (httpResponseCode>0) {
+    payload = http.getString();
+    Serial.println(payload);
+    DynamicJsonDocument doc(512);
+    DeserializationError error = deserializeJson(doc, payload);
+    if(error){
+      Serial.println("Error parsing JSON");
+      }
+    JsonObject jObj = doc.as<JsonObject>();
+    if(jObj.containsKey("bayStatus"))
+      {
+        int val = jObj["bayStatus"].as<int>();
+        writeToLED(val);
+      }
+  }
+  
+  http.end();
 
+ 
+}
+void CheckValue() {
+  digitalWrite(echoPin, LOW);
+  delay(10);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  float duration = pulseIn(echoPin, HIGH);
+  int distance = duration * 0.034 / 2;
+
+  bool currentOccupied = (distance >carHeight);
+  if(currentOccupied == previousOccupied)
+  {
+    
+    if(currentOccupied != currentState) 
+    {
+      updateParkingState(currentOccupied);
+    }
+    currentState = currentOccupied; 
+  }
+  previousOccupied = currentOccupied;
+}
 void writeToLED (int color) // numbers above 7 ignored 
 {
   if(color > 7)
@@ -110,6 +232,8 @@ void writeToLED (int color) // numbers above 7 ignored
     return;
   }
   std::string strCol = std::bitset<3>(color).to_string();
+  Serial.println("writing value to LED : " );
+  Serial.print(color );
   for(int i = 0 ; i< 3 ;i++)
   {
     if(strCol[i] == '1')
